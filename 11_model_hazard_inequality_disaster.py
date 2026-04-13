@@ -2,39 +2,28 @@
 Project: Flood Inequality Across Brazil
 
 Module: 11_model_hazard_inequality_disaster.py
+Version: v3.0 — Scientific inference edition
 
-Purpose:
-Model the relationship between hydroclimatic hazard, social inequality,
-and observed disaster impacts across Brazilian municipalities.
+Scientific question:
+  Does social inequality amplify the impact of hydroclimatic hazard
+  on observed disaster outcomes across Brazilian municipalities?
 
-Main target:
-- disaster_observed_index
+Analytical strategy (publication-grade):
+  1. Moderation analysis — OLS with hazard × social_inequality
+     interaction term as the central test of amplification
+  2. Spatial regression — Spatial Lag Model (SLM) and Spatial Error
+     Model (SEM) via PySAL/spreg to correct for spatial autocorrelation
+     and produce robust associative coefficients
+  3. Quadrant disparity analysis — comparing disaster impact distributions
+     across hazard × inequality quadrants (high/low × high/low)
+     to isolate the social amplification effect
 
-Models:
-- Explainable Boosting Regressor (main model)
-- Elastic Net (baseline linear regularized)
-- Random Forest Regressor (baseline nonlinear)
-
-Outputs:
-- model_matrix.parquet
-- model_metrics.csv
-- feature_importance_ebm.csv
-- feature_importance_rf.csv
-- partial_effects_ebm.parquet
-- model_predictions.parquet
-- fig11_model_performance_and_interpretation.png
-- fig11_model_performance_and_interpretation.pdf
-- 11_model_hazard_inequality_disaster.meta.json
-- 11_model_hazard_inequality_disaster.log
-
-Changelog v2.1 (from v2.0):
-- choose_features() updated: s2id_feat_* columns are now ALLOWED as
-  predictors (structural disaster exposure features from Module 10).
-  Only raw s2id_ annual counts remain blocked (target leakage risk).
-- delete stale checkpoints before re-run if target changed (v3.0 of M10)
+Publication figures (500 DPI, Nature/Science style):
+  fig11a_moderation_analysis.png     — 5-panel
+  fig11b_spatial_regression.png      — 5-panel
+  fig11c_quadrant_disparity.png      — 5-panel
 
 Author: Enner H. de Alcântara
-Version: v2.1
 Language: English
 """
 
@@ -49,908 +38,901 @@ import warnings
 import subprocess
 from datetime import datetime
 from pathlib import Path
+from itertools import combinations
 
 import numpy as np
 import pandas as pd
 import geopandas as gpd
-import joblib
+from scipy import stats
+from scipy.stats import mannwhitneyu, kruskal
 
-from sklearn.model_selection import KFold
-from sklearn.impute import SimpleImputer
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import (
-    r2_score,
-    mean_absolute_error,
-    mean_squared_error,
-)
-from sklearn.linear_model import ElasticNetCV
-from sklearn.ensemble import RandomForestRegressor
+import statsmodels.api as sm
+from statsmodels.nonparametric.smoothers_lowess import lowess
 
 import matplotlib
 import matplotlib.pyplot as plt
-from matplotlib import gridspec
+import matplotlib.patches as mpatches
+import matplotlib.colors as mcolors
+import matplotlib.gridspec as gridspec
 
-def _ensure_tqdm():
+def _ensure(pkg, install_name=None):
     try:
-        import tqdm  # noqa
+        __import__(pkg)
     except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "tqdm"])
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "-q",
+             install_name or pkg])
 
-_ensure_tqdm()
+_ensure("tqdm")
+_ensure("libpysal", "libpysal")
+_ensure("esda",     "esda")
+_ensure("spreg",    "spreg")
+
 from tqdm.auto import tqdm
+import libpysal
+from libpysal.weights import Queen, KNN
+import esda
+from esda.moran import Moran, Moran_Local
+import spreg
 
 # =========================================================
-# 2. OPTIONAL DEPENDENCY — interpret
-# =========================================================
-def ensure_interpret():
-    try:
-        from interpret.glassbox import ExplainableBoostingRegressor  # noqa
-    except Exception:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "interpret"])
-
-ensure_interpret()
-from interpret.glassbox import ExplainableBoostingRegressor
-
-# =========================================================
-# 3. PATHS AND CONSTANTS
+# 2. PATHS AND CONSTANTS
 # =========================================================
 BASE_PATH = Path("/content/drive/MyDrive/Brazil/flood_inequality_project")
 
-CONFIG_PATH  = BASE_PATH / "00_config"  / "config.json"
 LOG_PATH     = BASE_PATH / "07_logs"    / "11_model_hazard_inequality_disaster.log"
 CATALOG_PATH = BASE_PATH / "08_catalog" / "catalog.csv"
+CONFIG_PATH  = BASE_PATH / "00_config"  / "config.json"
 
-INPUT_SUMMARY_PATH = (
+INPUT_PATH = (
     BASE_PATH / "04_integrated"
     / "hazard_social_disaster_municipal_summary_brazil.geoparquet"
 )
 
-OUTPUT_DIR     = BASE_PATH / "05_modeling"
-CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
-FIG_DIR        = BASE_PATH / "06_figures"
-
+OUTPUT_DIR = BASE_PATH / "05_modeling"
+FIG_DIR    = BASE_PATH / "06_figures"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 FIG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-OUTPUT_MATRIX         = OUTPUT_DIR / "model_matrix.parquet"
-OUTPUT_METRICS        = OUTPUT_DIR / "model_metrics.csv"
-OUTPUT_EBM_IMPORTANCE = OUTPUT_DIR / "feature_importance_ebm.csv"
-OUTPUT_RF_IMPORTANCE  = OUTPUT_DIR / "feature_importance_rf.csv"
-OUTPUT_PARTIALS       = OUTPUT_DIR / "partial_effects_ebm.parquet"
-OUTPUT_PREDICTIONS    = OUTPUT_DIR / "model_predictions.parquet"
-OUTPUT_META           = OUTPUT_DIR / "11_model_hazard_inequality_disaster.meta.json"
+OUT_MODERATION = OUTPUT_DIR / "moderation_results.csv"
+OUT_SPATIAL    = OUTPUT_DIR / "spatial_regression_results.csv"
+OUT_QUADRANT   = OUTPUT_DIR / "quadrant_disparity_results.csv"
+OUT_META       = OUTPUT_DIR / "11_model_hazard_inequality_disaster.meta.json"
 
-OUTPUT_FIG_PNG = FIG_DIR / "fig11_model_performance_and_interpretation.png"
-OUTPUT_FIG_PDF = FIG_DIR / "fig11_model_performance_and_interpretation.pdf"
+FIG_A_PNG = FIG_DIR / "fig11a_moderation_analysis.png"
+FIG_A_PDF = FIG_DIR / "fig11a_moderation_analysis.pdf"
+FIG_B_PNG = FIG_DIR / "fig11b_spatial_regression.png"
+FIG_B_PDF = FIG_DIR / "fig11b_spatial_regression.pdf"
+FIG_C_PNG = FIG_DIR / "fig11c_quadrant_disparity.png"
+FIG_C_PDF = FIG_DIR / "fig11c_quadrant_disparity.pdf"
 
-TARGET_COL        = "disaster_observed_index"
-CV_FOLDS          = 10
-RANDOM_STATE      = 42
-VERBOSE           = False
-KEEP_CHECKPOINTS  = False
-SHOW_FIG_IN_COLAB = True
+TARGET   = "disaster_observed_index"
+HAZARD   = "hazard_recent_extremes_index"
+SOCIAL   = "social_inequality_index"
+CAPACITY = "adaptive_capacity_index"
+TREND    = "hazard_trend_index"
+RANDOM_STATE = 42
 
 # =========================================================
-# 4. LOGGING
+# 3. LOGGING
 # =========================================================
-def setup_logger(log_path: Path, verbose: bool) -> logging.Logger:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger("module_11")
-    logger.setLevel(logging.DEBUG)
-    logger.handlers.clear()
-    fmt = logging.Formatter(
-        "[%(asctime)s] [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+logging.basicConfig(
+    filename=str(LOG_PATH), filemode="a",
+    format="[%(asctime)s] [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S", level=logging.INFO,
+)
+_logger = logging.getLogger("module_11_v3")
+
+def log(msg, level="INFO"):
+    _logger.info(f"[{level}] {msg}")
+    if level in ("WARNING", "ERROR", "SUMMARY"):
+        print(f"[{level}] {msg}")
+
+# =========================================================
+# 4. PUBLICATION STYLE
+# =========================================================
+def set_pub_style():
+    matplotlib.rcParams.update({
+        "font.family"      : "serif",
+        "font.serif"       : ["Times New Roman", "DejaVu Serif", "Times"],
+        "font.size"        : 7,
+        "axes.linewidth"   : 0.6,
+        "axes.spines.top"  : False,
+        "axes.spines.right": False,
+        "axes.labelsize"   : 7,
+        "axes.titlesize"   : 7.5,
+        "axes.titleweight" : "bold",
+        "axes.titlepad"    : 5,
+        "xtick.major.width": 0.5,
+        "ytick.major.width": 0.5,
+        "xtick.major.size" : 2.5,
+        "ytick.major.size" : 2.5,
+        "xtick.labelsize"  : 6,
+        "ytick.labelsize"  : 6,
+        "legend.fontsize"  : 5.5,
+        "legend.frameon"   : True,
+        "legend.framealpha": 0.9,
+        "legend.edgecolor" : "#CCCCCC",
+        "figure.dpi"       : 72,
+        "savefig.dpi"      : 500,
+        "pdf.fonttype"     : 42,
+        "ps.fonttype"      : 42,
+    })
+
+C = {
+    "bg"    : "#FFFFFF",
+    "panel" : "#F7F7F7",
+    "text"  : "#1A1A2E",
+    "sub"   : "#555577",
+    "border": "#CCCCCC",
+    "blue"  : "#1D4E89",
+    "red"   : "#9B2226",
+    "teal"  : "#2A7F6F",
+    "amber" : "#B5621B",
+    "purple": "#5C4374",
+    "gray"  : "#888888",
+    "HH"    : "#9B2226",
+    "HL"    : "#E07B39",
+    "LH"    : "#4A7CB5",
+    "LL"    : "#2A7F6F",
+}
+
+def plabel(ax, letter, x=0.03, y=0.97):
+    ax.text(x, y, letter, transform=ax.transAxes,
+            fontsize=10, fontweight="bold", va="top",
+            color=C["text"], fontfamily="serif")
+
+def grid_style(ax, axis="both"):
+    ax.grid(axis=axis, linewidth=0.22, color=C["border"],
+            alpha=0.8, zorder=0, linestyle="--")
+
+def save_fig(fig, png_path, pdf_path):
+    fig.savefig(png_path, dpi=500, bbox_inches="tight", facecolor=C["bg"])
+    fig.savefig(pdf_path, bbox_inches="tight", facecolor=C["bg"])
+    try:
+        from IPython.display import display
+        display(fig)
+    except Exception:
+        plt.show()
+    plt.close(fig)
+
+# =========================================================
+# 5. LOAD AND PREPARE
+# =========================================================
+def load_and_prepare() -> gpd.GeoDataFrame:
+    log("Loading input ...", "SUMMARY")
+    gdf = gpd.read_parquet(INPUT_PATH)
+    if gdf.crs is None or gdf.crs.to_epsg() != 4326:
+        gdf = gdf.set_crs("EPSG:4326", allow_override=True)
+
+    needed = [TARGET, HAZARD, SOCIAL, CAPACITY, TREND]
+    for col in needed:
+        if col in gdf.columns:
+            gdf[col] = pd.to_numeric(gdf[col], errors="coerce")
+        else:
+            gdf[col] = np.nan
+
+    gdf = gdf.dropna(subset=[TARGET, HAZARD, SOCIAL]).reset_index(drop=True)
+
+    for col in [TARGET, HAZARD, SOCIAL, CAPACITY, TREND]:
+        mu = gdf[col].mean(skipna=True)
+        sd = gdf[col].std(skipna=True, ddof=1)
+        gdf[f"{col}_std"] = (gdf[col] - mu) / sd if (sd and sd > 0) else 0.0
+
+    gdf["hazard_x_social"] = gdf[f"{HAZARD}_std"] * gdf[f"{SOCIAL}_std"]
+
+    h_med = gdf[HAZARD].median()
+    s_med = gdf[SOCIAL].median()
+    h, s  = gdf[HAZARD], gdf[SOCIAL]
+    gdf["quadrant"] = np.select(
+        [h.ge(h_med) & s.ge(s_med),
+         h.ge(h_med) & s.lt(s_med),
+         h.lt(h_med) & s.ge(s_med)],
+        ["HH", "HL", "LH"],
+        default="LL",
     )
-    fh = logging.FileHandler(log_path, encoding="utf-8")
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG if verbose else logging.WARNING)
-    ch.setFormatter(fmt)
-    logger.addHandler(ch)
-    return logger
 
-log = setup_logger(LOG_PATH, VERBOSE)
+    reg_col = next((c for c in gdf.columns
+                    if "region" in c.lower() and gdf[c].dtype == object), None)
+    if reg_col:
+        mapping = {
+            "Norte": "North", "Nordeste": "Northeast",
+            "Centro-Oeste": "Center-West",
+            "Sudeste": "Southeast", "Sul": "South",
+        }
+        gdf["region_en"] = gdf[reg_col].map(mapping).fillna(gdf[reg_col])
+    else:
+        gdf["region_en"] = "Brazil"
 
-def log_summary(message: str) -> None:
-    log.warning("SUMMARY | " + message)
+    log(f"Ready: {len(gdf):,} municipalities | "
+        f"quadrants: {gdf['quadrant'].value_counts().to_dict()}", "SUMMARY")
+    return gdf
 
 # =========================================================
-# 5. HELPERS
+# 6. MODERATION ANALYSIS
 # =========================================================
-def read_config(path: Path) -> dict:
-    if not path.exists():
-        return {}
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+def run_moderation(gdf: gpd.GeoDataFrame) -> dict:
+    log("Moderation analysis ...", "SUMMARY")
 
-def write_config(path: Path, cfg: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=4)
+    cols = [f"{TARGET}_std", f"{HAZARD}_std", f"{SOCIAL}_std",
+            f"{CAPACITY}_std", f"{TREND}_std", "hazard_x_social"]
+    df   = pd.DataFrame(gdf[cols].dropna())
+    y    = df[f"{TARGET}_std"]
 
-def update_catalog(stage: str, tile_id: str, output_path: str, status: str) -> None:
+    specs = {
+        "M1 Hazard only" : [f"{HAZARD}_std"],
+        "M2 Social only" : [f"{SOCIAL}_std"],
+        "M3 Additive"    : [f"{HAZARD}_std", f"{SOCIAL}_std",
+                            f"{CAPACITY}_std", f"{TREND}_std"],
+        "M4 Interaction" : [f"{HAZARD}_std", f"{SOCIAL}_std",
+                            f"{CAPACITY}_std", f"{TREND}_std",
+                            "hazard_x_social"],
+    }
+
+    results, rows = {}, []
+    for name, preds in specs.items():
+        X = sm.add_constant(df[preds])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            res = sm.OLS(y, X).fit(cov_type="HC3")
+        results[name] = res
+        for var in preds + ["const"]:
+            ci = res.conf_int()
+            rows.append({
+                "model"  : name, "variable": var,
+                "coef"   : res.params.get(var, np.nan),
+                "se"     : res.bse.get(var, np.nan),
+                "t"      : res.tvalues.get(var, np.nan),
+                "p"      : res.pvalues.get(var, np.nan),
+                "ci_low" : ci.loc[var, 0] if var in ci.index else np.nan,
+                "ci_high": ci.loc[var, 1] if var in ci.index else np.nan,
+                "r2"     : res.rsquared,
+                "r2_adj" : res.rsquared_adj,
+                "n"      : int(res.nobs),
+            })
+
+    coef_df = pd.DataFrame(rows)
+    coef_df.to_csv(OUT_MODERATION, index=False)
+
+    m4   = results["M4 Interaction"]
+    b_h  = m4.params.get(f"{HAZARD}_std", 0)
+    b_hx = m4.params.get("hazard_x_social", 0)
+    marginal = {
+        "Low inequality (P10)"   : b_h + b_hx * df[f"{SOCIAL}_std"].quantile(0.10),
+        "Medium inequality (P50)": b_h + b_hx * df[f"{SOCIAL}_std"].quantile(0.50),
+        "High inequality (P90)"  : b_h + b_hx * df[f"{SOCIAL}_std"].quantile(0.90),
+    }
+
+    log(f"M4 R²={m4.rsquared:.3f} | "
+        f"interaction p={m4.pvalues.get('hazard_x_social', np.nan):.4f}", "SUMMARY")
+    return {"results": results, "coef_df": coef_df,
+            "marginal": marginal, "m4": m4, "df": df}
+
+# =========================================================
+# 7. SPATIAL REGRESSION
+# =========================================================
+def run_spatial_regression(gdf: gpd.GeoDataFrame) -> dict:
+    log("Building spatial weights ...", "SUMMARY")
+    gdf_proj = gdf.to_crs("EPSG:5880").copy()
+
+    cols    = [f"{TARGET}_std", f"{HAZARD}_std", f"{SOCIAL}_std",
+               f"{CAPACITY}_std", f"{TREND}_std", "hazard_x_social"]
+    mask    = gdf[cols].notna().all(axis=1)
+    gdf_v   = gdf.iloc[np.where(mask)[0]].reset_index(drop=True)
+    gdf_p_v = gdf_proj.iloc[np.where(mask)[0]].reset_index(drop=True)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            W = Queen.from_dataframe(gdf_p_v, silence_warnings=True)
+        except Exception:
+            W = KNN.from_dataframe(gdf_p_v, k=6, silence_warnings=True)
+    W.transform = "r"
+
+    y      = gdf_v[f"{TARGET}_std"].values
+    X_cols = [f"{HAZARD}_std", f"{SOCIAL}_std",
+              f"{CAPACITY}_std", f"{TREND}_std", "hazard_x_social"]
+    X      = gdf_v[X_cols].values
+
+    log("Running OLS, SLM, SEM ...", "SUMMARY")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ols = spreg.OLS(y.reshape(-1,1), X, w=W,
+                        name_y=TARGET, name_x=X_cols,
+                        spat_diag=True, moran=True)
+        slm = spreg.ML_Lag(y.reshape(-1,1), X, w=W,
+                           name_y=TARGET, name_x=X_cols)
+        sem = spreg.ML_Error(y.reshape(-1,1), X, w=W,
+                             name_y=TARGET, name_x=X_cols)
+
+    moran_y = Moran(y, W)
+    moran_r = Moran(ols.u.flatten(), W)
+    lisa    = Moran_Local(y, W, permutations=499, seed=RANDOM_STATE)
+
+    rows, var_labels = [], ["const"] + X_cols
+    for mname, res in [("OLS", ols), ("SLM", slm), ("SEM", sem)]:
+        betas = res.betas.flatten()
+        ses   = np.sqrt(np.diag(res.vm)) if res.vm is not None else [np.nan]*len(betas)
+        for i, (b, s) in enumerate(zip(betas, ses)):
+            lbl = var_labels[i] if i < len(var_labels) else "spatial_param"
+            rows.append({
+                "model"   : mname, "variable": lbl,
+                "coef"    : float(b), "se": float(s),
+                "z"       : float(b/s) if s > 0 else np.nan,
+                "p"       : float(2*(1 - stats.norm.cdf(abs(b/s)))) if s > 0 else np.nan,
+            })
+
+    coef_df = pd.DataFrame(rows)
+    coef_df.to_csv(OUT_SPATIAL, index=False)
+
+    log(f"SLM ρ={slm.betas[-1][0]:.4f} | SEM λ={sem.betas[-1][0]:.4f} | "
+        f"Moran I(resid)={moran_r.I:.4f} p={moran_r.p_sim:.4f}", "SUMMARY")
+
+    return {"W": W, "results": {"OLS": ols, "SLM": slm, "SEM": sem},
+            "coef_df": coef_df, "moran_y": moran_y, "moran_r": moran_r,
+            "lisa": lisa, "gdf_v": gdf_v, "y": y, "X_cols": X_cols,
+            "slm": slm, "sem": sem, "ols": ols}
+
+# =========================================================
+# 8. QUADRANT DISPARITY
+# =========================================================
+def run_quadrant_disparity(gdf: gpd.GeoDataFrame) -> dict:
+    log("Quadrant disparity analysis ...", "SUMMARY")
+    quads = ["HH", "HL", "LH", "LL"]
+    ql    = {"HH": "High H.\nHigh Ineq.", "HL": "High H.\nLow Ineq.",
+             "LH": "Low H.\nHigh Ineq.", "LL": "Low H.\nLow Ineq."}
+    dists = {q: gdf.loc[gdf["quadrant"] == q, TARGET].dropna() for q in quads}
+
+    global_rows = []
+    for q in quads:
+        s = dists[q]
+        global_rows.append({
+            "quadrant": q, "label": ql[q], "n": len(s),
+            "mean": s.mean(), "median": s.median(), "std": s.std(),
+            "p25": s.quantile(0.25), "p75": s.quantile(0.75),
+            "p90": s.quantile(0.90),
+        })
+
+    mw_rows = []
+    for q1, q2 in combinations(quads, 2):
+        a, b  = dists[q1].values, dists[q2].values
+        u, p  = mannwhitneyu(a, b, alternative="two-sided")
+        pool  = np.sqrt((a.std()**2 + b.std()**2) / 2)
+        d     = (a.mean() - b.mean()) / pool if pool > 0 else np.nan
+        mw_rows.append({"comparison": f"{q1} vs {q2}", "U": u, "p": p, "cohens_d": d})
+
+    kw_stat, kw_p = kruskal(*[dists[q].values for q in quads])
+    _, hh_hl_p    = mannwhitneyu(dists["HH"].values, dists["HL"].values,
+                                  alternative="greater")
+
+    reg_rows = []
+    for reg in gdf["region_en"].dropna().unique():
+        rgdf = gdf[gdf["region_en"] == reg]
+        for q in quads:
+            s = rgdf.loc[rgdf["quadrant"] == q, TARGET].dropna()
+            if len(s) >= 5:
+                reg_rows.append({"region": reg, "quadrant": q, "n": len(s),
+                                  "mean": s.mean(), "median": s.median(),
+                                  "p90": s.quantile(0.90)})
+
+    global_df = pd.DataFrame(global_rows)
+    mw_df     = pd.DataFrame(mw_rows)
+    region_df = pd.DataFrame(reg_rows)
+    pd.concat([global_df, mw_df], axis=1).to_csv(OUT_QUADRANT, index=False)
+
+    log(f"KW H={kw_stat:.2f} p={kw_p:.2e} | "
+        f"HH vs HL (amplification) p={hh_hl_p:.4f}", "SUMMARY")
+    return {"global_df": global_df, "mw_df": mw_df, "region_df": region_df,
+            "kw_stat": kw_stat, "kw_p": kw_p, "hh_hl_p": hh_hl_p,
+            "dists": dists, "ql": ql}
+
+# =========================================================
+# 9. FIGURE A — MODERATION
+# =========================================================
+def make_figure_a(mod: dict, gdf: gpd.GeoDataFrame) -> str:
+    set_pub_style()
+    fig = plt.figure(figsize=(7.2, 9.0))
+    fig.patch.set_facecolor(C["bg"])
+    gs = gridspec.GridSpec(3, 2, figure=fig,
+                           left=0.10, right=0.97, top=0.93, bottom=0.07,
+                           hspace=0.54, wspace=0.38)
+
+    ax_r2   = fig.add_subplot(gs[0, 0])
+    ax_me   = fig.add_subplot(gs[0, 1])
+    ax_coef = fig.add_subplot(gs[1, :])
+    ax_sc   = fig.add_subplot(gs[2, 0])
+    ax_res  = fig.add_subplot(gs[2, 1])
+
+    for ax in [ax_r2, ax_me, ax_coef, ax_sc, ax_res]:
+        ax.set_facecolor(C["bg"])
+        for sp in ax.spines.values():
+            sp.set_linewidth(0.5); sp.set_color(C["border"])
+
+    results = mod["results"]
+    m4, df  = mod["m4"], mod["df"]
+
+    # a) R² comparison
+    names = list(results.keys())
+    r2v   = [results[m].rsquared     for m in names]
+    r2av  = [results[m].rsquared_adj for m in names]
+    xlbls = ["M1\nHazard", "M2\nSocial", "M3\nAdditive", "M4\nInteract."]
+    x     = np.arange(len(names))
+    ax_r2.bar(x-0.18, r2v,  0.32, label="R²",     color=C["blue"], alpha=0.85, edgecolor="w", lw=0.4)
+    ax_r2.bar(x+0.18, r2av, 0.32, label="R²adj.", color=C["teal"], alpha=0.78, edgecolor="w", lw=0.4)
+    ax_r2.set_xticks(x); ax_r2.set_xticklabels(xlbls, fontsize=6)
+    ax_r2.set_ylabel("Coefficient of determination"); ax_r2.legend(fontsize=5.5)
+    ax_r2.set_title("Model fit comparison"); grid_style(ax_r2, "y")
+    for i, (v1, v2) in enumerate(zip(r2v, r2av)):
+        ax_r2.text(i-0.18, v1+0.002, f"{v1:.3f}", ha="center", fontsize=4.8, color=C["blue"])
+        ax_r2.text(i+0.18, v2+0.002, f"{v2:.3f}", ha="center", fontsize=4.8, color=C["teal"])
+    plabel(ax_r2, "a")
+
+    # b) Marginal effects
+    me   = mod["marginal"]
+    lbls = list(me.keys()); vals = list(me.values())
+    bars = ax_me.barh(lbls, vals, color=[C["teal"], C["amber"], C["red"]],
+                      alpha=0.87, edgecolor="w", lw=0.4, height=0.5)
+    ax_me.axvline(0, color=C["text"], lw=0.7, ls="--")
+    ax_me.set_xlabel("Marginal effect of hazard on disaster impact")
+    ax_me.set_title("Social inequality as moderator"); grid_style(ax_me, "x")
+    for bar, v in zip(bars, vals):
+        ax_me.text(v+(0.003 if v >= 0 else -0.003),
+                   bar.get_y()+bar.get_height()/2,
+                   f"{v:+.3f}", va="center",
+                   ha="left" if v >= 0 else "right", fontsize=5.5)
+    p_int = m4.pvalues.get("hazard_x_social", np.nan)
+    b_int = m4.params.get("hazard_x_social", np.nan)
+    ax_me.text(0.97, 0.05,
+               f"Interaction β={b_int:.3f}\n"
+               f"p {'<0.001' if p_int < 0.001 else f'={p_int:.3f}'}",
+               transform=ax_me.transAxes, ha="right", va="bottom", fontsize=5.5,
+               bbox=dict(boxstyle="round,pad=0.3", fc=C["panel"], ec=C["border"], lw=0.5))
+    plabel(ax_me, "b")
+
+    # c) Forest plot M4
+    var_map = {
+        f"{HAZARD}_std"  : "Hydroclimatic hazard",
+        f"{SOCIAL}_std"  : "Social inequality",
+        f"{CAPACITY}_std": "Adaptive capacity",
+        f"{TREND}_std"   : "Hazard trend",
+        "hazard_x_social": "Hazard × Inequality (interaction)",
+    }
+    m4c = mod["coef_df"][
+        (mod["coef_df"]["model"] == "M4 Interaction") &
+        (mod["coef_df"]["variable"] != "const")
+    ].copy()
+    m4c["label"] = m4c["variable"].map(var_map).fillna(m4c["variable"])
+    m4c = m4c.sort_values("coef")
+    yp  = np.arange(len(m4c))
+    fc  = [C["red"] if p < 0.05 else C["gray"] for p in m4c["p"]]
+    # barh não aceita lista no ecolor — separar barras e error bars
+    ax_coef.barh(yp, m4c["coef"].values, color=fc,
+                 edgecolor="w", lw=0.3, height=0.5, alpha=0.87)
+    for i, (_, row) in enumerate(m4c.iterrows()):
+        ec = C["red"] if row["p"] < 0.05 else C["gray"]
+        ax_coef.errorbar(row["coef"], i,
+                         xerr=[[row["coef"] - row["ci_low"]],
+                               [row["ci_high"] - row["coef"]]],
+                         fmt="none", ecolor=ec, elinewidth=0.8,
+                         capsize=2.5, capthick=0.8)
+    ax_coef.axvline(0, color=C["text"], lw=0.8, ls="--")
+    ax_coef.set_yticks(yp)
+    ax_coef.set_yticklabels(m4c["label"].values, fontsize=6.5)
+    ax_coef.set_xlabel("Standardized coefficient (β) with 95% CI  [HC3-robust SE]")
+    ax_coef.set_title(
+        f"M4 interaction model  (R²={m4.rsquared:.3f}, "
+        f"R²adj={m4.rsquared_adj:.3f}, n={int(m4.nobs):,})")
+    grid_style(ax_coef, "x")
+    for i, (_, row) in enumerate(m4c.iterrows()):
+        sig = ("***" if row["p"]<0.001 else "**" if row["p"]<0.01
+               else "*" if row["p"]<0.05 else "ns")
+        ax_coef.text(ax_coef.get_xlim()[1]*0.98, i, sig, ha="right", va="center",
+                     fontsize=6, color=C["red"] if sig != "ns" else C["gray"])
+    ax_coef.text(0.99, -0.11, "*** p<0.001  ** p<0.01  * p<0.05  ns not significant",
+                 transform=ax_coef.transAxes, ha="right", fontsize=5, color=C["gray"])
+    plabel(ax_coef, "c")
+
+    # d) Moderation scatter
+    sc = ax_sc.scatter(df[f"{HAZARD}_std"], df[f"{TARGET}_std"],
+                       c=df[f"{SOCIAL}_std"], cmap="RdYlBu_r",
+                       s=3, alpha=0.38, linewidths=0, zorder=3)
+    plt.colorbar(sc, ax=ax_sc, shrink=0.75, pad=0.02, label="Social inequality (std)")
+    h_range = np.linspace(df[f"{HAZARD}_std"].min(), df[f"{HAZARD}_std"].max(), 100)
+    b_h  = m4.params.get(f"{HAZARD}_std", 0)
+    b_hx = m4.params.get("hazard_x_social", 0)
+    b_s  = m4.params.get(f"{SOCIAL}_std", 0)
+    b0   = m4.params.get("const", 0)
+    for lbl, sq, col in [
+        ("Low inequality (P10)",  df[f"{SOCIAL}_std"].quantile(0.10), C["teal"]),
+        ("High inequality (P90)", df[f"{SOCIAL}_std"].quantile(0.90), C["red"]),
+    ]:
+        ax_sc.plot(h_range, b0+b_h*h_range+b_s*sq+b_hx*h_range*sq,
+                   color=col, lw=1.2, label=lbl, zorder=4)
+    ax_sc.legend(fontsize=5, loc="upper left")
+    ax_sc.set_xlabel("Hydroclimatic hazard (std)")
+    ax_sc.set_ylabel("Disaster impact (std)")
+    ax_sc.set_title("Moderation: hazard effect by inequality level")
+    grid_style(ax_sc); plabel(ax_sc, "d")
+
+    # e) Residuals
+    fitted = m4.fittedvalues; resid = m4.resid
+    ax_res.scatter(fitted, resid, s=2.5, alpha=0.3, color=C["blue"], linewidths=0, zorder=3)
+    ax_res.axhline(0, color=C["red"], lw=0.8, ls="--")
+    try:
+        sm_ = lowess(resid, fitted, frac=0.3)
+        ax_res.plot(sm_[:, 0], sm_[:, 1], color=C["amber"], lw=1.0, zorder=4)
+    except Exception:
+        pass
+    ax_res.set_xlabel("Fitted values"); ax_res.set_ylabel("Residuals")
+    ax_res.set_title("Residual diagnostics (M4)")
+    grid_style(ax_res); plabel(ax_res, "e")
+
+    fig.suptitle(
+        "Figure 11a  |  Moderation analysis: social inequality amplifies "
+        "hydroclimatic hazard impacts across Brazilian municipalities",
+        fontsize=8, fontweight="bold", color=C["text"], y=0.975)
+    fig.text(0.5, 0.013,
+             f"OLS with HC3-robust SE | standardized variables | n={int(m4.nobs):,} municipalities",
+             ha="center", fontsize=5.5, color=C["sub"])
+
+    save_fig(fig, FIG_A_PNG, FIG_A_PDF)
+    log(f"Figure A saved: {FIG_A_PNG}", "SUMMARY")
+    return str(FIG_A_PNG)
+
+# =========================================================
+# 10. FIGURE B — SPATIAL REGRESSION
+# =========================================================
+def make_figure_b(spa: dict, gdf: gpd.GeoDataFrame) -> str:
+    set_pub_style()
+    fig = plt.figure(figsize=(7.2, 9.2))
+    fig.patch.set_facecolor(C["bg"])
+    gs = gridspec.GridSpec(3, 2, figure=fig,
+                           left=0.07, right=0.97, top=0.93, bottom=0.07,
+                           hspace=0.54, wspace=0.30)
+
+    ax_mi   = fig.add_subplot(gs[0, 0])
+    ax_lisa = fig.add_subplot(gs[0, 1])
+    ax_coef = fig.add_subplot(gs[1, :])
+    ax_slm  = fig.add_subplot(gs[2, 0])
+    ax_diag = fig.add_subplot(gs[2, 1])
+
+    for ax in [ax_mi, ax_lisa, ax_coef, ax_slm, ax_diag]:
+        ax.set_facecolor(C["bg"])
+        for sp in ax.spines.values():
+            sp.set_linewidth(0.5); sp.set_color(C["border"])
+
+    W, y    = spa["W"], spa["y"]
+    gdf_v   = spa["gdf_v"].copy()
+    moran_y = spa["moran_y"]; moran_r = spa["moran_r"]
+    lisa    = spa["lisa"]; coef_df = spa["coef_df"]
+    X_cols  = spa["X_cols"]
+    slm_r   = spa["slm"]; sem_r = spa["sem"]; ols_r = spa["ols"]
+
+    # a) Moran scatterplot
+    Wy = libpysal.weights.lag_spatial(W, y)
+    ax_mi.scatter(y, Wy, s=2.5, alpha=0.28, color=C["blue"], linewidths=0, zorder=3)
+    zf = np.polyfit(y, Wy, 1); xl = np.linspace(y.min(), y.max(), 100)
+    ax_mi.plot(xl, np.poly1d(zf)(xl), color=C["red"], lw=1.2, zorder=4)
+    ax_mi.axhline(0, color=C["border"], lw=0.4); ax_mi.axvline(0, color=C["border"], lw=0.4)
+    ax_mi.set_xlabel("Disaster impact (std)"); ax_mi.set_ylabel("Spatial lag")
+    ax_mi.set_title(f"Global Moran's I = {moran_y.I:.4f}  (p = {moran_y.p_sim:.3f})")
+    grid_style(ax_mi); plabel(ax_mi, "a")
+
+    # b) LISA cluster map
+    lc  = {"HH": C["HH"], "LL": C["LL"], "LH": C["LH"], "HL": C["HL"], "ns": "#DDDDDD"}
+    sig = lisa.p_sim < 0.05; q = lisa.q
+    cat = np.where(~sig, "ns", np.where(q==1, "HH", np.where(q==3, "LL", np.where(q==2, "LH", "HL"))))
+    gdf_v["lisa_color"] = [lc[c] for c in cat]
+    gdf_v.plot(color=gdf_v["lisa_color"], ax=ax_lisa, linewidth=0.05, edgecolor="white")
+    ax_lisa.axis("off"); ax_lisa.set_title("LISA cluster map (Local Moran's I)")
+    lp = [mpatches.Patch(color=lc[k], label=k) for k in ["HH","HL","LH","LL","ns"]]
+    ax_lisa.legend(handles=lp, fontsize=5, loc="lower left", ncol=2,
+                   framealpha=0.9, edgecolor=C["border"])
+    plabel(ax_lisa, "b")
+
+    # c) Coefficient comparison OLS vs SLM vs SEM
+    vmap   = {f"{HAZARD}_std": "Hazard", f"{SOCIAL}_std": "Social ineq.",
+              f"{CAPACITY}_std": "Adapt. capacity", f"{TREND}_std": "Hazard trend",
+              "hazard_x_social": "Hazard×Ineq."}
+    pvars  = [v for v in X_cols if v in vmap]
+    mnames = ["OLS", "SLM", "SEM"]; mcols = [C["blue"], C["amber"], C["teal"]]
+    xb     = np.arange(len(pvars)); w = 0.22
+    for mi, (mn, mc) in enumerate(zip(mnames, mcols)):
+        sub = coef_df[coef_df["model"] == mn]
+        cs  = [sub.loc[sub["variable"]==v, "coef"].values[0]
+               if len(sub.loc[sub["variable"]==v]) else np.nan for v in pvars]
+        ses = [sub.loc[sub["variable"]==v, "se"].values[0]
+               if len(sub.loc[sub["variable"]==v]) else np.nan for v in pvars]
+        cs = np.array(cs); ses = np.array(ses)
+        ax_coef.bar(xb+(mi-1)*w, cs, w, label=mn, color=mc, alpha=0.83, edgecolor="w", lw=0.3)
+        ax_coef.errorbar(xb+(mi-1)*w, cs, yerr=1.96*ses, fmt="none",
+                         ecolor=mc, elinewidth=0.7, capsize=2)
+    ax_coef.axhline(0, color=C["text"], lw=0.7, ls="--")
+    ax_coef.set_xticks(xb); ax_coef.set_xticklabels([vmap[v] for v in pvars], fontsize=6.5)
+    ax_coef.set_ylabel("Coefficient (standardized)")
+    ax_coef.set_title("Coefficient stability: OLS vs Spatial Lag (SLM) vs Spatial Error (SEM)")
+    ax_coef.legend(fontsize=5.5, loc="upper right"); grid_style(ax_coef, "y")
+    ax_coef.text(0.01, 0.97,
+                 f"SLM ρ={slm_r.betas[-1][0]:.4f}  |  SEM λ={sem_r.betas[-1][0]:.4f}  |  "
+                 f"Moran I(OLS resid)={moran_r.I:.4f}  p={moran_r.p_sim:.3f}",
+                 transform=ax_coef.transAxes, va="top", fontsize=5.5,
+                 bbox=dict(boxstyle="round,pad=0.3", fc=C["panel"], ec=C["border"], lw=0.4))
+    plabel(ax_coef, "c")
+
+    # d) SLM predicted map
+    gdf_v["slm_pred"] = slm_r.predy.flatten()
+    gdf_v.plot(column="slm_pred", cmap="YlOrRd", ax=ax_slm, legend=True,
+               linewidth=0.05, edgecolor="white",
+               legend_kwds={"shrink": 0.6, "label": "Predicted (std)"})
+    ax_slm.axis("off"); ax_slm.set_title("SLM predicted disaster impact"); plabel(ax_slm, "d")
+
+    # e) Diagnostics table
+    ax_diag.axis("off")
+    diag = []
+    for mn, res in [("OLS", ols_r), ("SLM", slm_r), ("SEM", sem_r)]:
+        r2  = getattr(res, "r2",    getattr(res, "pr2",   None))
+        aic = getattr(res, "aic",   None)
+        ll  = getattr(res, "logll", None)
+        diag.append([mn, f"{r2:.4f}" if r2 is not None else "—",
+                     f"{aic:.1f}" if aic is not None else "—",
+                     f"{ll:.1f}"  if ll  is not None else "—"])
+    tbl = ax_diag.table(cellText=diag, colLabels=["Model", "R²/pseudo-R²", "AIC", "Log-L"],
+                         cellLoc="center", loc="center", bbox=[0.0, 0.25, 1.0, 0.60])
+    tbl.auto_set_font_size(False); tbl.set_fontsize(6.5)
+    for (r, c_), cell in tbl.get_celld().items():
+        cell.set_edgecolor(C["border"]); cell.set_linewidth(0.4)
+        if r == 0:
+            cell.set_facecolor(C["blue"]); cell.set_text_props(color="white", fontweight="bold")
+        else:
+            cell.set_facecolor(C["panel"] if r%2==0 else C["bg"])
+    ax_diag.set_title("Model fit diagnostics"); plabel(ax_diag, "e")
+
+    fig.suptitle(
+        "Figure 11b  |  Spatial regression: correcting for spatial "
+        "autocorrelation in flood inequality associations",
+        fontsize=8, fontweight="bold", color=C["text"], y=0.975)
+    fig.text(0.5, 0.013,
+             "Queen contiguity weights | row-standardized | ML estimation | 499 permutations (LISA)",
+             ha="center", fontsize=5.5, color=C["sub"])
+
+    save_fig(fig, FIG_B_PNG, FIG_B_PDF)
+    log(f"Figure B saved: {FIG_B_PNG}", "SUMMARY")
+    return str(FIG_B_PNG)
+
+# =========================================================
+# 11. FIGURE C — QUADRANT DISPARITY
+# =========================================================
+def make_figure_c(qd: dict, gdf: gpd.GeoDataFrame) -> str:
+    set_pub_style()
+    fig = plt.figure(figsize=(7.2, 9.2))
+    fig.patch.set_facecolor(C["bg"])
+    gs = gridspec.GridSpec(3, 2, figure=fig,
+                           left=0.10, right=0.97, top=0.93, bottom=0.07,
+                           hspace=0.54, wspace=0.36)
+
+    ax_map  = fig.add_subplot(gs[0, :])
+    ax_viol = fig.add_subplot(gs[1, 0])
+    ax_eff  = fig.add_subplot(gs[1, 1])
+    ax_reg  = fig.add_subplot(gs[2, 0])
+    ax_p90  = fig.add_subplot(gs[2, 1])
+
+    for ax in [ax_map, ax_viol, ax_eff, ax_reg, ax_p90]:
+        ax.set_facecolor(C["bg"])
+        for sp in ax.spines.values():
+            sp.set_linewidth(0.5); sp.set_color(C["border"])
+
+    quads  = ["HH", "HL", "LH", "LL"]
+    qcols  = [C["HH"], C["HL"], C["LH"], C["LL"]]
+    ql     = qd["ql"]; dists = qd["dists"]; gdf_df = qd["global_df"]
+
+    # a) Quadrant map
+    gdf["_qc"] = gdf["quadrant"].map(
+        {"HH": C["HH"], "HL": C["HL"], "LH": C["LH"], "LL": C["LL"]}
+    ).fillna("#DDDDDD")
+    gdf.plot(color=gdf["_qc"], ax=ax_map, linewidth=0.04, edgecolor="white")
+    ax_map.axis("off")
+    ax_map.set_title("Municipality quadrant classification  (Hydroclimatic hazard × Social inequality)")
+    lp = [mpatches.Patch(color=C[q],
+                          label=f"{q}  {ql[q].replace(chr(10),' ')}  "
+                                f"(n={int(gdf_df.loc[gdf_df['quadrant']==q,'n'].values[0]):,})")
+          for q in quads]
+    ax_map.legend(handles=lp, fontsize=5.5, loc="lower left", ncol=2,
+                  framealpha=0.92, edgecolor=C["border"])
+    plabel(ax_map, "a")
+
+    # b) Violin distributions
+    vdata = [dists[q].values for q in quads]
+    parts = ax_viol.violinplot(vdata, positions=range(4), showmedians=True, showextrema=False)
+    for pc, col in zip(parts["bodies"], qcols):
+        pc.set_facecolor(mcolors.to_rgba(col, 0.42)); pc.set_edgecolor(col); pc.set_linewidth(0.8)
+    parts["cmedians"].set_color(C["text"]); parts["cmedians"].set_linewidth(1.2)
+    rng = np.random.default_rng(42)
+    for i, (q, col) in enumerate(zip(quads, qcols)):
+        jit = rng.uniform(-0.08, 0.08, len(dists[q]))
+        ax_viol.scatter(i+jit, dists[q].values, s=0.9, alpha=0.12, color=col, linewidths=0, zorder=2)
+    ax_viol.set_xticks(range(4)); ax_viol.set_xticklabels([ql[q] for q in quads], fontsize=6)
+    ax_viol.set_ylabel("Disaster impact index")
+    ax_viol.set_title("Disaster impact distribution by quadrant")
+    grid_style(ax_viol, "y")
+    kw_p = qd["kw_p"]
+    ax_viol.text(0.97, 0.97,
+                 f"Kruskal-Wallis\nH={qd['kw_stat']:.2f}\n"
+                 f"p {'<0.001' if kw_p<0.001 else f'={kw_p:.3f}'}",
+                 transform=ax_viol.transAxes, ha="right", va="top", fontsize=5.5,
+                 bbox=dict(boxstyle="round,pad=0.3", fc=C["panel"], ec=C["border"], lw=0.5))
+    plabel(ax_viol, "b")
+
+    # c) Effect sizes
+    pairs = [("HH vs LL","HH","LL"),("HH vs HL","HH","HL"),
+             ("LH vs LL","LH","LL"),("HL vs LL","HL","LL")]
+    ef_rows = []
+    for lbl, q1, q2 in pairs:
+        a, b_ = dists[q1].values, dists[q2].values
+        pool  = np.sqrt((a.std()**2+b_.std()**2)/2)
+        d     = (a.mean()-b_.mean())/pool if pool > 0 else np.nan
+        _, p  = mannwhitneyu(a, b_, alternative="two-sided")
+        ef_rows.append({"label": lbl, "d": d, "p": p})
+    edf   = pd.DataFrame(ef_rows)
+    bcols = [C["red"] if p<0.05 else C["gray"] for p in edf["p"]]
+    bars  = ax_eff.barh(edf["label"], edf["d"], color=bcols, alpha=0.85, edgecolor="w", lw=0.4, height=0.5)
+    ax_eff.axvline(0, color=C["text"], lw=0.7, ls="--")
+    for thresh, lbl_ in [(0.2,"small"),(0.5,"medium"),(0.8,"large")]:
+        ax_eff.axvline(thresh, color=C["border"], lw=0.5, ls=":")
+        ax_eff.text(thresh+0.01, -0.6, lbl_, fontsize=4.5, color=C["gray"])
+    for bar, row in zip(bars, edf.itertuples()):
+        sig = "***" if row.p<0.001 else "**" if row.p<0.01 else "*" if row.p<0.05 else "ns"
+        ax_eff.text(row.d+0.01, bar.get_y()+bar.get_height()/2,
+                    f"d={row.d:.2f} {sig}", va="center", fontsize=5.5)
+    ax_eff.set_xlabel("Cohen's d (effect size)")
+    ax_eff.set_title("Pairwise effect sizes (Mann-Whitney U)")
+    grid_style(ax_eff, "x"); plabel(ax_eff, "c")
+
+    # d) Regional breakdown
+    reg_df  = qd["region_df"]; regions = sorted(reg_df["region"].unique())
+    xr      = np.arange(len(regions)); wr = 0.18
+    for qi, (q, col) in enumerate(zip(quads, qcols)):
+        vals = [reg_df.loc[(reg_df["region"]==r)&(reg_df["quadrant"]==q), "mean"].values[0]
+                if len(reg_df.loc[(reg_df["region"]==r)&(reg_df["quadrant"]==q)]) else np.nan
+                for r in regions]
+        ax_reg.bar(xr+(qi-1.5)*wr, vals, wr, label=q, color=col, alpha=0.83, edgecolor="w", lw=0.3)
+    ax_reg.set_xticks(xr)
+    ax_reg.set_xticklabels(regions, fontsize=5.5, rotation=15, ha="right")
+    ax_reg.set_ylabel("Mean disaster impact"); ax_reg.set_title("Regional breakdown by quadrant")
+    ax_reg.legend(fontsize=5, loc="upper right", ncol=2)
+    grid_style(ax_reg, "y"); plabel(ax_reg, "d")
+
+    # e) P90 + social amplification
+    p90v  = [gdf_df.loc[gdf_df["quadrant"]==q,"p90"].values[0]  for q in quads]
+    meanv = [gdf_df.loc[gdf_df["quadrant"]==q,"mean"].values[0] for q in quads]
+    nv    = [gdf_df.loc[gdf_df["quadrant"]==q,"n"].values[0]    for q in quads]
+    xp    = np.arange(4)
+    ax_p90.bar(xp, p90v, color=qcols, alpha=0.85, edgecolor="w", lw=0.4, label="P90")
+    ax_p90.scatter(xp, meanv, color=C["text"], s=20, zorder=5, marker="D", label="Mean")
+    ax_p90.set_xticks(xp); ax_p90.set_xticklabels([ql[q] for q in quads], fontsize=6)
+    ax_p90.set_ylabel("Disaster impact index"); ax_p90.set_title("90th percentile vs mean impact")
+    ax_p90.legend(fontsize=5.5, loc="upper right"); grid_style(ax_p90, "y")
+    for i, (v, n) in enumerate(zip(p90v, nv)):
+        ax_p90.text(i, v+0.001, f"n={int(n):,}", ha="center", fontsize=4.8, color=C["text"])
+    diff = p90v[0] - p90v[1]
+    if diff > 0:
+        ax_p90.annotate("", xy=(0, p90v[0]+0.007), xytext=(1, p90v[1]+0.007),
+                         arrowprops=dict(arrowstyle="<->", color=C["red"], lw=1.0))
+        ax_p90.text(0.5, max(p90v[0], p90v[1])+0.013,
+                    f"Social amplification\n+{diff:.4f}",
+                    ha="center", fontsize=5.5, color=C["red"], fontweight="bold")
+    plabel(ax_p90, "e")
+
+    hh_hl_p = qd["hh_hl_p"]
+    fig.suptitle(
+        "Figure 11c  |  Quadrant disparity: social inequality amplifies "
+        "flood disaster impacts across Brazilian municipalities",
+        fontsize=8, fontweight="bold", color=C["text"], y=0.975)
+    fig.text(0.5, 0.013,
+             f"Social amplification (HH vs HL, Mann-Whitney one-sided): "
+             f"p {'<0.001' if hh_hl_p<0.001 else f'={hh_hl_p:.4f}'}  |  "
+             "Effect size thresholds: small d=0.2, medium d=0.5, large d=0.8",
+             ha="center", fontsize=5.5, color=C["sub"])
+
+    save_fig(fig, FIG_C_PNG, FIG_C_PDF)
+    log(f"Figure C saved: {FIG_C_PNG}", "SUMMARY")
+    return str(FIG_C_PNG)
+
+# =========================================================
+# 12. SAVE META
+# =========================================================
+def save_meta(mod, spa, qd, gdf):
+    m4 = mod["m4"]
+    meta = {
+        "project"          : "Flood Inequality Across Brazil",
+        "module"           : "11_model_hazard_inequality_disaster.py",
+        "version"          : "v3.0",
+        "status"           : "completed",
+        "created_at"       : datetime.now().isoformat(),
+        "n_municipalities" : int(len(gdf)),
+        "target"           : TARGET,
+        "approach"         : ["moderation_ols_hc3", "spatial_lag_model",
+                              "spatial_error_model", "quadrant_disparity_mannwhitney"],
+        "m4_r2"            : float(m4.rsquared),
+        "m4_r2_adj"        : float(m4.rsquared_adj),
+        "m4_interaction_p" : float(m4.pvalues.get("hazard_x_social", np.nan)),
+        "moran_i_target"   : float(spa["moran_y"].I),
+        "moran_p_residuals": float(spa["moran_r"].p_sim),
+        "kruskal_wallis_p" : float(qd["kw_p"]),
+        "social_amplif_p"  : float(qd["hh_hl_p"]),
+        "fig_a"            : str(FIG_A_PNG),
+        "fig_b"            : str(FIG_B_PNG),
+        "fig_c"            : str(FIG_C_PNG),
+    }
+    with open(OUT_META, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=4)
+
     row = pd.DataFrame([{
-        "stage":       stage,
-        "tile_id":     tile_id,
-        "period":      "2013_2022",
-        "status":      status,
-        "output_path": output_path,
-        "timestamp":   datetime.now().isoformat(),
+        "stage": "11_model_hazard_inequality_disaster", "tile_id": "ALL",
+        "period": "2013_2022", "status": "completed",
+        "output_path": str(OUT_MODERATION),
+        "timestamp": datetime.now().isoformat(),
     }])
     if CATALOG_PATH.exists():
         try:
-            df = pd.read_csv(CATALOG_PATH)
-            df = df[~((df["stage"] == stage) & (df["tile_id"] == tile_id))]
-            df = pd.concat([df, row], ignore_index=True)
-            df.to_csv(CATALOG_PATH, index=False)
-            return
+            cat = pd.read_csv(CATALOG_PATH)
+            cat = cat[~((cat["stage"]=="11_model_hazard_inequality_disaster")&
+                        (cat["tile_id"]=="ALL"))]
+            pd.concat([cat, row], ignore_index=True).to_csv(CATALOG_PATH, index=False)
         except Exception:
-            pass
-    row.to_csv(CATALOG_PATH, index=False)
-
-def rmse(y_true, y_pred):
-    return np.sqrt(mean_squared_error(y_true, y_pred))
-
-def get_imputed_feature_names(pipeline: Pipeline, input_features: list) -> list:
-    imputer = pipeline.named_steps["imputer"]
-    try:
-        return list(imputer.get_feature_names_out(input_features))
-    except AttributeError:
-        n_out = len(imputer.statistics_)
-        if n_out == len(input_features):
-            return input_features
-        return input_features[:n_out]
-
-def checkpoint_path(model_name: str) -> Path:
-    return CHECKPOINT_DIR / f"checkpoint_{model_name}.pkl"
-
-def checkpoint_meta_path(model_name: str) -> Path:
-    return CHECKPOINT_DIR / f"checkpoint_{model_name}_meta.json"
-
-def save_checkpoint(model_name: str, pipeline: Pipeline, oof_pred: np.ndarray,
-                    metrics_row: dict) -> None:
-    joblib.dump(pipeline, checkpoint_path(model_name))
-    with open(checkpoint_meta_path(model_name), "w", encoding="utf-8") as f:
-        json.dump({**metrics_row, "oof_pred": oof_pred.tolist()}, f)
-    log_summary(f"Checkpoint saved: {model_name}")
-
-def load_checkpoint(model_name: str):
-    cp  = checkpoint_path(model_name)
-    cpm = checkpoint_meta_path(model_name)
-    if not cp.exists() or not cpm.exists():
-        return None
-    pipeline = joblib.load(cp)
-    with open(cpm, encoding="utf-8") as f:
-        meta = json.load(f)
-    oof_pred = np.array(meta.pop("oof_pred"))
-    log_summary(f"Checkpoint loaded (skipping training): {model_name}")
-    return pipeline, oof_pred, meta
-
-def remove_checkpoints(model_names: list) -> None:
-    for name in model_names:
-        for p in [checkpoint_path(name), checkpoint_meta_path(name)]:
-            if p.exists():
-                p.unlink()
-    log_summary("Checkpoints removed.")
-
-def purge_stale_checkpoints() -> None:
-    """
-    Remove all existing checkpoints before a new run.
-    Required when the target (disaster_observed_index) was rebuilt
-    in Module 10 v3.0 — old checkpoints trained on the v2.1 target
-    would produce misleading results.
-    """
-    removed = 0
-    for p in CHECKPOINT_DIR.glob("checkpoint_*"):
-        p.unlink()
-        removed += 1
-    if removed:
-        print(f"  ⚠  Purged {removed} stale checkpoint(s) from previous run.")
-        log_summary(f"Purged {removed} stale checkpoints.")
-
-# =========================================================
-# 6. LOAD DATA
-# =========================================================
-def load_input() -> pd.DataFrame:
-    if not INPUT_SUMMARY_PATH.exists():
-        raise FileNotFoundError(f"Input not found: {INPUT_SUMMARY_PATH}")
-    gdf = gpd.read_parquet(INPUT_SUMMARY_PATH)
-    if gdf.empty:
-        raise RuntimeError("Input summary dataset is empty.")
-    df = pd.DataFrame(gdf.drop(columns="geometry").copy())
-    if TARGET_COL not in df.columns:
-        raise RuntimeError(f"Target column not found: {TARGET_COL}")
-    return df
-
-# =========================================================
-# 7. FEATURE SELECTION  (v2.1 — s2id_feat_* now ALLOWED)
-# =========================================================
-def choose_features(df: pd.DataFrame) -> list:
-    """
-    Select numeric predictor columns for modeling.
-
-    Blacklist:
-      - Municipality identifiers
-      - Target column and its direct derivatives
-      - Raw s2id_ annual event counts (prefix "s2id_" without "s2id_feat_")
-        → these are aggregated into the target; keeping them would be leakage
-      - Compound index columns (built from the target; leakage)
-      - Categorical classification columns
-
-    Allowed (intentionally):
-      - s2id_feat_* → structural S2ID features built in Module 10
-        (historical flood frequency, trend slope, acceleration, etc.)
-        These reflect long-run disaster exposure and are legitimate predictors.
-    """
-    blacklist = {
-        "mun_code",
-        "mun_name",
-        "uf_code",
-        "uf_sigla",
-        # Target and direct derivatives
-        TARGET_COL,
-        "disaster_observed_raw",
-        "annual_disaster_observed_index_mean",
-        "annual_disaster_observed_index_max",
-        # Compound index (built using the target — leakage)
-        "hazard_social_disaster_compound_raw",
-        "hazard_social_disaster_compound_index",
-        # Categorical
-        "triple_burden_flag",
-        "hazard_social_quadrant",
-        "compound_class_q",
-    }
-
-    features = []
-    for col in df.columns:
-        if col in blacklist:
-            continue
-        # Block raw S2ID annual counts but ALLOW s2id_feat_* structural features
-        if col.startswith("s2id_") and not col.startswith("s2id_feat_"):
-            continue
-        if pd.api.types.is_numeric_dtype(df[col]):
-            features.append(col)
-
-    return sorted(features)
-
-# =========================================================
-# 8. BUILD MODEL MATRIX
-# =========================================================
-def build_model_matrix(df: pd.DataFrame):
-    features = choose_features(df)
-
-    X = df[features].copy()
-    y = pd.to_numeric(df[TARGET_COL], errors="coerce")
-
-    valid = y.notna()
-    X = X.loc[valid].reset_index(drop=True)
-    y = y.loc[valid].reset_index(drop=True)
-
-    if len(X) == 0:
-        raise RuntimeError("No valid rows remained after filtering target.")
-
-    all_nan_cols = [c for c in features if X[c].isna().all()]
-    if all_nan_cols:
-        log_summary(f"Columns with ALL-NaN values (dropped): {all_nan_cols}")
-        X = X.drop(columns=all_nan_cols)
-        features = [c for c in features if c not in all_nan_cols]
-
-    matrix = X.copy()
-    matrix[TARGET_COL] = y
-
-    return X, y, features, matrix
-
-# =========================================================
-# 9. MODEL DEFINITIONS
-# =========================================================
-def build_models() -> dict:
-    ebm = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("model", ExplainableBoostingRegressor(
-            random_state=RANDOM_STATE,
-            interactions=10,
-            outer_bags=8,
-            inner_bags=0,
-            learning_rate=0.03,
-            max_rounds=5000,
-            min_samples_leaf=4,
-            max_leaves=3,
-        )),
-    ])
-
-    enet = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler()),
-        ("model", ElasticNetCV(
-            l1_ratio=[0.1, 0.5, 0.9, 1.0],
-            alphas=np.logspace(-3, 1, 30),
-            cv=5,
-            random_state=RANDOM_STATE,
-            max_iter=50_000,
-        )),
-    ])
-
-    rf = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("model", RandomForestRegressor(
-            n_estimators=500,
-            max_depth=None,
-            min_samples_split=4,
-            min_samples_leaf=2,
-            random_state=RANDOM_STATE,
-            n_jobs=-1,
-        )),
-    ])
-
-    return {"EBM": ebm, "ElasticNet": enet, "RandomForest": rf}
-
-# =========================================================
-# 10. CROSS-VALIDATION WITH PROGRESS BAR
-# =========================================================
-def _cv_with_progress(model, X, y, cv, model_name: str):
-    r2s, maes, rmses = [], [], []
-    oof_pred = np.full(len(y), np.nan)
-
-    folds = list(cv.split(X, y))
-
-    with tqdm(folds, desc=f"  CV folds [{model_name}]",
-              unit="fold", leave=False, colour="cyan") as pbar:
-        for train_idx, val_idx in pbar:
-            X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
-            y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
-
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore")
-                model.fit(X_tr, y_tr)
-
-            preds = model.predict(X_val)
-            oof_pred[val_idx] = preds
-
-            fold_r2   = r2_score(y_val, preds)
-            fold_mae  = mean_absolute_error(y_val, preds)
-            fold_rmse = rmse(y_val, preds)
-
-            r2s.append(fold_r2)
-            maes.append(fold_mae)
-            rmses.append(fold_rmse)
-
-            pbar.set_postfix(r2=f"{fold_r2:.3f}", mae=f"{fold_mae:.4f}")
-
-    return {
-        "cv_r2_mean":   np.mean(r2s),
-        "cv_r2_std":    np.std(r2s),
-        "cv_mae_mean":  np.mean(maes),
-        "cv_mae_std":   np.std(maes),
-        "cv_rmse_mean": np.mean(rmses),
-        "cv_rmse_std":  np.std(rmses),
-        "oof_r2":       r2_score(y, oof_pred),
-        "oof_mae":      mean_absolute_error(y, oof_pred),
-        "oof_rmse":     rmse(y, oof_pred),
-    }, oof_pred
-
-# =========================================================
-# 11. MODEL EVALUATION WITH CHECKPOINTING
-# =========================================================
-def evaluate_models(models: dict, X: pd.DataFrame, y: pd.Series):
-    cv = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
-
-    metrics_rows  = []
-    fitted_models = {}
-
-    def _flush_metrics():
-        (
-            pd.DataFrame(metrics_rows)
-            .sort_values("cv_r2_mean", ascending=False)
-            .reset_index(drop=True)
-            .to_csv(OUTPUT_METRICS, index=False)
-        )
-
-    model_names = list(models.keys())
-
-    with tqdm(model_names, desc="Models", unit="model",
-              colour="green", position=0) as outer_bar:
-        for name in outer_bar:
-            outer_bar.set_description(f"Model: {name}")
-            model = models[name]
-
-            cached = load_checkpoint(name)
-            if cached is not None:
-                fitted_pipeline, oof_pred, metrics_row = cached
-                metrics_row["model"] = name
-                log_summary(f"[{name}] Loaded from checkpoint.")
-                tqdm.write(f"  ✓ {name}: loaded from checkpoint "
-                           f"(OOF R²={metrics_row['oof_r2']:.4f})")
-            else:
-                log_summary(f"Starting CV: {name}")
-                cv_metrics, oof_pred = _cv_with_progress(model, X, y, cv, name)
-
-                tqdm.write(f"  → Fitting {name} on full dataset…")
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore")
-                    model.fit(X, y)
-
-                fitted_pipeline = model
-                metrics_row = {"model": name, **cv_metrics}
-                save_checkpoint(name, fitted_pipeline, oof_pred, metrics_row)
-
-                tqdm.write(
-                    f"  ✓ {name}: OOF R²={metrics_row['oof_r2']:.4f} | "
-                    f"CV R²={metrics_row['cv_r2_mean']:.4f} "
-                    f"(±{metrics_row['cv_r2_std']:.4f})"
-                )
-
-            metrics_rows.append(metrics_row)
-            fitted_models[name] = {
-                "pipeline": fitted_pipeline,
-                "oof_pred": oof_pred,
-            }
-
-            _flush_metrics()
-            log_summary(f"Metrics saved after: {name}")
-
-    metrics_df = (
-        pd.DataFrame(metrics_rows)
-        .sort_values("cv_r2_mean", ascending=False)
-        .reset_index(drop=True)
-    )
-    return metrics_df, fitted_models
-
-# =========================================================
-# 12. INTERPRETATION OUTPUTS
-# =========================================================
-def extract_ebm_outputs(fitted_pipeline: Pipeline,
-                        X: pd.DataFrame,
-                        y: pd.Series,
-                        input_features: list):
-    ebm = fitted_pipeline.named_steps["model"]
-    global_exp = ebm.explain_global()
-    data = global_exp.data()
-
-    names  = data["names"]
-    scores = data["scores"]
-
-    imp_df = (
-        pd.DataFrame({"feature": names, "importance": scores})
-        .sort_values("importance", ascending=False)
-        .reset_index(drop=True)
-    )
-
-    partial_rows = []
-    with tqdm(enumerate(names), desc="  EBM partial effects",
-              total=len(names), unit="feat", leave=False, colour="yellow") as pbar:
-        for i, feat in pbar:
-            feat_data = global_exp.data(i)
-            xs = feat_data.get("names", [])
-            ys = feat_data.get("scores", [])
-            for xv, yv in zip(xs, ys):
-                partial_rows.append({"feature": feat, "x": str(xv), "effect": yv})
-
-    partial_df = pd.DataFrame(partial_rows)
-    return imp_df, partial_df
-
-def extract_rf_importance(fitted_pipeline: Pipeline, input_features: list):
-    rf_step      = fitted_pipeline.named_steps["model"]
-    actual_names = get_imputed_feature_names(fitted_pipeline, input_features)
-
-    n_expected = len(rf_step.feature_importances_)
-    if len(actual_names) != n_expected:
-        log_summary(
-            f"WARNING: feature name count ({len(actual_names)}) != "
-            f"RF importances length ({n_expected}). Truncating/padding."
-        )
-        actual_names = actual_names[:n_expected]
-        while len(actual_names) < n_expected:
-            actual_names.append(f"unknown_{len(actual_names)}")
-
-    imp_df = (
-        pd.DataFrame({"feature": actual_names,
-                      "importance": rf_step.feature_importances_})
-        .sort_values("importance", ascending=False)
-        .reset_index(drop=True)
-    )
-    return imp_df
-
-# =========================================================
-# 13. PREDICTIONS TABLE
-# =========================================================
-def build_predictions_table(df: pd.DataFrame, y: pd.Series,
-                             fitted_models: dict):
-    pred = pd.DataFrame({
-        "mun_code": df.loc[y.index, "mun_code"].astype(str).values,
-        "observed_disaster_observed_index": y.values,
-    })
-    for name, obj in fitted_models.items():
-        pred[f"pred_{name}"] = obj["oof_pred"]
-    return pred
-
-# =========================================================
-# 14. FIGURE GENERATION
-# =========================================================
-def _truncate_label(text: str, max_len: int = 38) -> str:
-    text = str(text)
-    return text if len(text) <= max_len else text[:max_len - 1] + "…"
-
-def make_figure_11_modeling(metrics: pd.DataFrame,
-                             ebm_importance: pd.DataFrame,
-                             rf_importance: pd.DataFrame,
-                             partials: pd.DataFrame,
-                             predictions: pd.DataFrame,
-                             dpi: int = 500,
-                             show_in_colab: bool = True) -> str:
-    matplotlib.rcParams.update({
-        "font.family"      : "sans-serif",
-        "font.sans-serif"  : ["Arial", "Helvetica", "DejaVu Sans"],
-        "font.size"        : 7,
-        "axes.linewidth"   : 0.5,
-        "axes.spines.top"  : False,
-        "axes.spines.right": False,
-        "figure.dpi"       : 72,
-        "pdf.fonttype"     : 42,
-        "ps.fonttype"      : 42,
-        "svg.fonttype"     : "none",
-        "xtick.major.width": 0.4,
-        "ytick.major.width": 0.4,
-        "xtick.labelsize"  : 5.5,
-        "ytick.labelsize"  : 5.5,
-    })
-
-    C = {
-        "bg"     : "#FAFAF8",
-        "text_hd": "#111827",
-        "text_sm": "#6B7280",
-        "border" : "#D1D5DB",
-        "blue"   : "#2166AC",
-        "teal"   : "#1B9E77",
-        "amber"  : "#D97706",
-        "red"    : "#C0504D",
-        "purple" : "#7B3294",
-        "gray"   : "#6B7280",
-    }
-
-    fig = plt.figure(figsize=(7.2, 9.2))
-    fig.patch.set_facecolor(C["bg"])
-
-    gs = gridspec.GridSpec(
-        3, 2, figure=fig,
-        left=0.08, right=0.98, top=0.94, bottom=0.07,
-        hspace=0.48, wspace=0.32,
-    )
-
-    ax_r2      = fig.add_subplot(gs[0, 0])
-    ax_rmse    = fig.add_subplot(gs[0, 1])
-    ax_scatter = fig.add_subplot(gs[1, 0])
-    ax_ebm     = fig.add_subplot(gs[1, 1])
-    ax_rf      = fig.add_subplot(gs[2, 0])
-    ax_pe      = fig.add_subplot(gs[2, 1])
-
-    for ax in [ax_r2, ax_rmse, ax_scatter, ax_ebm, ax_rf, ax_pe]:
-        ax.set_facecolor("white")
-        for sp in ax.spines.values():
-            sp.set_linewidth(0.5)
-            sp.set_color(C["border"])
-
-    metrics_plot = metrics.copy()
-    order = metrics_plot["model"].tolist()
-    palette = [C["blue"], C["amber"], C["teal"]][:len(order)]
-
-    # a) OOF R²
-    ax_r2.bar(order, metrics_plot["oof_r2"], color=palette,
-              edgecolor="white", linewidth=0.4)
-    ax_r2.set_ylabel("Out-of-fold R²", fontsize=6, color=C["text_sm"])
-    ax_r2.set_title("Predictive performance (R²)", fontsize=7.2,
-                    color=C["text_hd"], pad=4)
-    ax_r2.grid(axis="y", linewidth=0.18, color=C["border"], alpha=0.7, zorder=0)
-    ax_r2.text(0.03, 0.97, "a", transform=ax_r2.transAxes,
-               fontsize=9, fontweight="bold", va="top", color=C["text_hd"])
-    for i, v in enumerate(metrics_plot["oof_r2"]):
-        ax_r2.text(i, v + 0.005, f"{v:.3f}", ha="center", va="bottom",
-                   fontsize=5.3, color=C["text_sm"])
-
-    # b) OOF RMSE
-    ax_rmse.bar(order, metrics_plot["oof_rmse"], color=palette,
-                edgecolor="white", linewidth=0.4)
-    ax_rmse.set_ylabel("Out-of-fold RMSE", fontsize=6, color=C["text_sm"])
-    ax_rmse.set_title("Predictive performance (RMSE)", fontsize=7.2,
-                      color=C["text_hd"], pad=4)
-    ax_rmse.grid(axis="y", linewidth=0.18, color=C["border"], alpha=0.7, zorder=0)
-    ax_rmse.text(0.03, 0.97, "b", transform=ax_rmse.transAxes,
-                 fontsize=9, fontweight="bold", va="top", color=C["text_hd"])
-    for i, v in enumerate(metrics_plot["oof_rmse"]):
-        ax_rmse.text(i, v + 0.005, f"{v:.4f}", ha="center", va="bottom",
-                     fontsize=5.3, color=C["text_sm"])
-
-    # c) Observed vs predicted
-    best_model = metrics_plot.iloc[0]["model"]
-    pred_col   = f"pred_{best_model}"
-    obs  = pd.to_numeric(predictions["observed_disaster_observed_index"],
-                         errors="coerce")
-    pred = pd.to_numeric(predictions[pred_col], errors="coerce")
-    valid = obs.notna() & pred.notna()
-
-    ax_scatter.scatter(obs[valid], pred[valid],
-                       s=5, alpha=0.35, linewidths=0, color=C["purple"])
-    if valid.any():
-        vmin = min(obs[valid].min(), pred[valid].min())
-        vmax = max(obs[valid].max(), pred[valid].max())
-        ax_scatter.plot([vmin, vmax], [vmin, vmax],
-                        ls="--", lw=0.7, color=C["gray"])
-
-    ax_scatter.set_xlabel("Observed disaster burden index",
-                          fontsize=6, color=C["text_sm"])
-    ax_scatter.set_ylabel(f"Predicted ({best_model})",
-                          fontsize=6, color=C["text_sm"])
-    ax_scatter.set_title("Observed vs predicted values",
-                         fontsize=7.2, color=C["text_hd"], pad=4)
-    ax_scatter.grid(linewidth=0.18, color=C["border"], alpha=0.7, zorder=0)
-    ax_scatter.text(0.03, 0.97, "c", transform=ax_scatter.transAxes,
-                    fontsize=9, fontweight="bold", va="top", color=C["text_hd"])
-    ax_scatter.text(
-        0.97, 0.05,
-        f"Best: {best_model}\nOOF R² = {metrics_plot.iloc[0]['oof_r2']:.3f}",
-        transform=ax_scatter.transAxes, ha="right", va="bottom",
-        fontsize=5.4, color=C["text_hd"],
-        bbox=dict(boxstyle="round,pad=0.25", fc="white",
-                  ec=C["border"], lw=0.5),
-    )
-
-    # d) EBM importance
-    top_ebm = ebm_importance.head(10).iloc[::-1].copy()
-    top_ebm["label"] = top_ebm["feature"].apply(_truncate_label)
-    ax_ebm.barh(top_ebm["label"], top_ebm["importance"],
-                color=C["blue"], edgecolor="white", linewidth=0.4)
-    ax_ebm.set_xlabel("Importance", fontsize=6, color=C["text_sm"])
-    ax_ebm.set_title("Top EBM features", fontsize=7.2,
-                     color=C["text_hd"], pad=4)
-    ax_ebm.grid(axis="x", linewidth=0.18, color=C["border"], alpha=0.7, zorder=0)
-    ax_ebm.text(0.03, 0.97, "d", transform=ax_ebm.transAxes,
-                fontsize=9, fontweight="bold", va="top", color=C["text_hd"])
-
-    # e) RF importance
-    top_rf = rf_importance.head(10).iloc[::-1].copy()
-    top_rf["label"] = top_rf["feature"].apply(_truncate_label)
-    ax_rf.barh(top_rf["label"], top_rf["importance"],
-               color=C["teal"], edgecolor="white", linewidth=0.4)
-    ax_rf.set_xlabel("Importance", fontsize=6, color=C["text_sm"])
-    ax_rf.set_title("Top Random Forest features", fontsize=7.2,
-                    color=C["text_hd"], pad=4)
-    ax_rf.grid(axis="x", linewidth=0.18, color=C["border"], alpha=0.7, zorder=0)
-    ax_rf.text(0.03, 0.97, "e", transform=ax_rf.transAxes,
-               fontsize=9, fontweight="bold", va="top", color=C["text_hd"])
-
-    # f) EBM partial effects (top feature)
-    if partials.empty:
-        ax_pe.text(0.5, 0.5, "No partial effects available",
-                   ha="center", va="center", fontsize=7, color=C["text_sm"])
-        ax_pe.set_xticks([]); ax_pe.set_yticks([])
+            row.to_csv(CATALOG_PATH, index=False)
     else:
-        feat_to_plot = ebm_importance.iloc[0]["feature"]
-        pe1 = partials.loc[partials["feature"] == feat_to_plot].copy()
-        if pe1.empty:
-            ax_pe.text(0.5, 0.5, "No plottable partial effects",
-                       ha="center", va="center", fontsize=7, color=C["text_sm"])
-            ax_pe.set_xticks([]); ax_pe.set_yticks([])
-        else:
-            pe1["x_num"] = pd.to_numeric(pe1["x"], errors="coerce")
-            if pe1["x_num"].notna().sum() >= 3:
-                pe1 = pe1.sort_values("x_num")
-                ax_pe.plot(pe1["x_num"], pe1["effect"],
-                           lw=1.2, color=C["red"])
-                ax_pe.scatter(pe1["x_num"], pe1["effect"],
-                              s=10, color=C["red"], linewidths=0)
-                ax_pe.set_xlabel(_truncate_label(feat_to_plot, 30),
-                                 fontsize=6, color=C["text_sm"])
-            else:
-                pe1 = pe1.reset_index(drop=True)
-                ax_pe.plot(np.arange(len(pe1)), pe1["effect"],
-                           lw=1.2, color=C["red"])
-                ax_pe.scatter(np.arange(len(pe1)), pe1["effect"],
-                              s=10, color=C["red"], linewidths=0)
-                ax_pe.set_xlabel("Binned feature levels",
-                                 fontsize=6, color=C["text_sm"])
-            ax_pe.set_ylabel("EBM effect", fontsize=6, color=C["text_sm"])
-            ax_pe.grid(linewidth=0.18, color=C["border"], alpha=0.7, zorder=0)
-
-    ax_pe.set_title("EBM partial effect (top feature)", fontsize=7.2,
-                    color=C["text_hd"], pad=4)
-    ax_pe.text(0.03, 0.97, "f", transform=ax_pe.transAxes,
-               fontsize=9, fontweight="bold", va="top", color=C["text_hd"])
-
-    fig.suptitle(
-        "Model performance and interpretation — municipal disaster burden (Brazil)",
-        fontsize=8.5, color=C["text_hd"], y=0.975,
-    )
-    fig.text(
-        0.5, 0.02,
-        "Target: weighted per-capita disaster impact index (Module 10 v3.0) | "
-        "Predictors include s2id_feat_* structural exposure features",
-        ha="center", va="center", fontsize=5.6, color=C["text_sm"],
-    )
-
-    fig.savefig(OUTPUT_FIG_PNG, dpi=dpi, bbox_inches="tight",
-                facecolor=fig.get_facecolor())
-    fig.savefig(OUTPUT_FIG_PDF, bbox_inches="tight",
-                facecolor=fig.get_facecolor())
-
-    if show_in_colab:
-        try:
-            from IPython.display import display
-            display(fig)
-        except Exception:
-            plt.show()
-
-    plt.close(fig)
-    return str(OUTPUT_FIG_PNG)
+        row.to_csv(CATALOG_PATH, index=False)
+    log("Meta and catalog saved.", "SUMMARY")
 
 # =========================================================
-# 15. SAVE OUTPUTS
+# 13. MAIN
 # =========================================================
-def save_outputs(matrix, metrics, ebm_importance, rf_importance,
-                 partials, predictions, features, n_obs):
-    with tqdm(total=6, desc="Saving outputs", unit="file",
-              colour="magenta", leave=False) as pbar:
-        matrix.to_parquet(OUTPUT_MATRIX, index=False);           pbar.update(1)
-        metrics.to_csv(OUTPUT_METRICS, index=False);             pbar.update(1)
-        ebm_importance.to_csv(OUTPUT_EBM_IMPORTANCE, index=False); pbar.update(1)
-        rf_importance.to_csv(OUTPUT_RF_IMPORTANCE, index=False); pbar.update(1)
-        partials.to_parquet(OUTPUT_PARTIALS, index=False);       pbar.update(1)
-        predictions.to_parquet(OUTPUT_PREDICTIONS, index=False); pbar.update(1)
+def main():
+    print("\n" + "=" * 68)
+    print("  Module 11 v3.0 — Flood Inequality in Brazil")
+    print("  Moderation + Spatial Regression + Quadrant Disparity")
+    print("=" * 68 + "\n")
 
-    meta = {
-        "project"               : "Flood Inequality Across Brazil",
-        "module"                : "11_model_hazard_inequality_disaster.py",
-        "version"               : "v2.1",
-        "status"                : "completed",
-        "created_at"            : datetime.now().isoformat(),
-        "input_summary_path"    : str(INPUT_SUMMARY_PATH),
-        "target_col"            : TARGET_COL,
-        "n_observations"        : int(n_obs),
-        "n_features"            : int(len(features)),
-        "features"              : features,
-        "cv_folds"              : CV_FOLDS,
-        "output_matrix"         : str(OUTPUT_MATRIX),
-        "output_metrics"        : str(OUTPUT_METRICS),
-        "output_ebm_importance" : str(OUTPUT_EBM_IMPORTANCE),
-        "output_rf_importance"  : str(OUTPUT_RF_IMPORTANCE),
-        "output_partials"       : str(OUTPUT_PARTIALS),
-        "output_predictions"    : str(OUTPUT_PREDICTIONS),
-        "output_figure_png"     : str(OUTPUT_FIG_PNG),
-        "output_figure_pdf"     : str(OUTPUT_FIG_PDF),
-    }
-    with open(OUTPUT_META, "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=4)
+    gdf = load_and_prepare()
 
-# =========================================================
-# 16. MAIN
-# =========================================================
-def main() -> None:
-    print("\n" + "=" * 65)
-    print("  Module 11 — Hazard × Inequality → Disaster Impact Modeling")
-    print("  Version: v2.1 | s2id_feat_* features enabled")
-    print("=" * 65 + "\n")
+    print("  [1/6] Moderation analysis ...")
+    mod = run_moderation(gdf)
 
-    # Purge stale checkpoints (target changed in Module 10 v3.0)
-    purge_stale_checkpoints()
+    print("  [2/6] Spatial regression ...")
+    spa = run_spatial_regression(gdf)
 
-    # Load data
-    with tqdm(total=1, desc="Loading input data", unit="file",
-              colour="blue", leave=False) as pbar:
-        df = load_input()
-        pbar.update(1)
+    print("  [3/6] Quadrant disparity ...")
+    qd  = run_quadrant_disparity(gdf)
 
-    config = read_config(CONFIG_PATH)
+    print("  [4/6] Rendering Figure A — moderation ...")
+    make_figure_a(mod, gdf)
 
-    # Build model matrix
-    with tqdm(total=1, desc="Building model matrix", unit="step",
-              colour="blue", leave=False) as pbar:
-        X, y, features, matrix = build_model_matrix(df)
-        pbar.update(1)
+    print("  [5/6] Rendering Figure B — spatial regression ...")
+    make_figure_b(spa, gdf)
 
-    # Report s2id_feat_ count
-    s2id_feat_cols = [f for f in features if f.startswith("s2id_feat_")]
-    log_summary(
-        f"Model matrix | obs={len(X):,} | features={len(features)} "
-        f"(incl. {len(s2id_feat_cols)} s2id_feat_*) | target={TARGET_COL}"
-    )
-    print(f"  Observations   : {len(X):,}")
-    print(f"  Features total : {len(features)}")
-    print(f"  → s2id_feat_*  : {len(s2id_feat_cols)}")
-    print(f"  Target         : {TARGET_COL}")
-    print(f"  Target mean    : {y.mean():.6f}  std: {y.std():.6f}  "
-          f"skew: {y.skew():.3f}\n")
+    print("  [6/6] Rendering Figure C — quadrant disparity ...")
+    make_figure_c(qd, gdf)
 
-    # Train / evaluate
-    models = build_models()
-    metrics, fitted_models = evaluate_models(models, X, y)
+    save_meta(mod, spa, qd, gdf)
 
-    print("\n  ── Cross-validation results ──")
-    print(metrics[["model", "cv_r2_mean", "cv_r2_std",
-                   "oof_r2", "oof_mae", "oof_rmse"]].to_string(index=False))
-
-    # Interpretation
-    print("\n  Extracting EBM interpretation outputs…")
-    ebm_importance, partials = extract_ebm_outputs(
-        fitted_models["EBM"]["pipeline"], X, y, features
-    )
-
-    print("  Extracting RF feature importances…")
-    rf_importance = extract_rf_importance(
-        fitted_models["RandomForest"]["pipeline"], features
-    )
-
-    # Predictions table
-    predictions = build_predictions_table(df, y, fitted_models)
-
-    # Save outputs
-    print("\n  Saving final outputs…")
-    save_outputs(
-        matrix=matrix, metrics=metrics,
-        ebm_importance=ebm_importance, rf_importance=rf_importance,
-        partials=partials, predictions=predictions,
-        features=features, n_obs=len(X),
-    )
-
-    # Figure
-    print("\n  Rendering publication-grade composite figure…")
-    with tqdm(total=1, desc="Rendering figure", unit="fig",
-              colour="magenta", leave=False) as pbar:
-        fig_path = make_figure_11_modeling(
-            metrics=metrics,
-            ebm_importance=ebm_importance,
-            rf_importance=rf_importance,
-            partials=partials,
-            predictions=predictions,
-            dpi=500,
-            show_in_colab=SHOW_FIG_IN_COLAB,
-        )
-        pbar.update(1)
-
-    print(f"  Figure saved: {fig_path}")
-
-    # Checkpoints
-    if not KEEP_CHECKPOINTS:
-        remove_checkpoints(list(fitted_models.keys()))
-
-    # Catalog + config
-    update_catalog(
-        stage="11_model_hazard_inequality_disaster",
-        tile_id="ALL",
-        output_path=str(OUTPUT_METRICS),
-        status="completed",
-    )
-
-    config["modeling_module_11"] = {
-        "version"              : "v2.1",
-        "name"                 : "hazard_inequality_disaster_models",
-        "target"               : TARGET_COL,
-        "metrics_csv"          : str(OUTPUT_METRICS),
-        "ebm_importance_csv"   : str(OUTPUT_EBM_IMPORTANCE),
-        "rf_importance_csv"    : str(OUTPUT_RF_IMPORTANCE),
-        "partials_parquet"     : str(OUTPUT_PARTIALS),
-        "predictions_parquet"  : str(OUTPUT_PREDICTIONS),
-        "figure_png"           : str(OUTPUT_FIG_PNG),
-        "figure_pdf"           : str(OUTPUT_FIG_PDF),
-        "meta_json"            : str(OUTPUT_META),
-        "n_observations"       : int(len(X)),
-        "n_features"           : int(len(features)),
-        "n_s2id_feat_features" : int(len(s2id_feat_cols)),
-    }
-    write_config(CONFIG_PATH, config)
-
-    log_summary("=" * 60)
-    log_summary(f"DONE | obs={len(X):,} | features={len(features)}")
-    log_summary("Module 11 v2.1 completed.")
-
-    print("\n" + "=" * 65)
-    print("  ✓ Module 11 completed successfully.")
-    print(f"  Outputs : {OUTPUT_DIR}")
-    print(f"  Figure  : {OUTPUT_FIG_PNG}")
-    print("=" * 65 + "\n")
+    m4 = mod["m4"]
+    print("\n" + "=" * 68)
+    print("  ✓ Module 11 v3.0 completed.")
+    print(f"\n  ── Key findings ──────────────────────────────────")
+    print(f"  n                  = {len(gdf):,} municipalities")
+    print(f"  M4 R²              = {m4.rsquared:.3f}  (R²adj={m4.rsquared_adj:.3f})")
+    p_int = m4.pvalues.get("hazard_x_social", np.nan)
+    b_int = m4.params.get("hazard_x_social", np.nan)
+    print(f"  Interaction β      = {b_int:.4f}  (p={p_int:.4f})")
+    print(f"  Moran I (target)   = {spa['moran_y'].I:.4f}  (p={spa['moran_y'].p_sim:.3f})")
+    print(f"  Kruskal-Wallis p   = {qd['kw_p']:.2e}")
+    print(f"  Social amplif. p   = {qd['hh_hl_p']:.4f}  (HH vs HL, one-sided)")
+    print(f"\n  ── Figures ───────────────────────────────────────")
+    print(f"  {FIG_A_PNG}")
+    print(f"  {FIG_B_PNG}")
+    print(f"  {FIG_C_PNG}")
+    print("=" * 68 + "\n")
 
 
-# Colab: chama main() diretamente
 main()
